@@ -1,1 +1,5 @@
 .DS_Store
+
+# Claude AI 相关文件
+.claude/
+CLAUDE.md
