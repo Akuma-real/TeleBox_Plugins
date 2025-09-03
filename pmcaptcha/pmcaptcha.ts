@@ -136,6 +136,102 @@ const activeChallenges = new Map<
   }
 >();
 
+// Bot status cache for performance optimization
+const botStatusCache = new Map<
+  number,
+  {
+    isBot: boolean;
+    timestamp: number;
+  }
+>();
+
+// Cache expiry time (1 hour in milliseconds)
+const CACHE_EXPIRY = 60 * 60 * 1000;
+
+// Clean expired cache entries periodically (every 10 minutes)
+setInterval(() => {
+  const now = Date.now();
+  let cleanedCount = 0;
+  
+  for (const [userId, entry] of botStatusCache.entries()) {
+    if (now - entry.timestamp >= CACHE_EXPIRY) {
+      botStatusCache.delete(userId);
+      cleanedCount++;
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`[PMCaptcha] Cleaned ${cleanedCount} expired cache entries`);
+  }
+}, 10 * 60 * 1000);
+
+// Check if user is a bot with caching
+async function isBotUser(
+  client: TelegramClient,
+  userId: number
+): Promise<boolean> {
+  try {
+    // Check cache first
+    const cached = botStatusCache.get(userId);
+    const now = Date.now();
+    
+    if (cached && (now - cached.timestamp) < CACHE_EXPIRY) {
+      // Silent cache hit - only log for bots to reduce noise
+      if (cached.isBot) {
+        console.log(`[PMCaptcha] Cache hit - ignoring bot user: ${userId}`);
+      }
+      return cached.isBot;
+    }
+
+    // Get user entity from Telegram with timeout protection
+    const entity = await Promise.race([
+      getEntityWithHash(client, userId),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Entity fetch timeout')), 10000)
+      )
+    ]) as any;
+    
+    if (!entity) {
+      console.warn(`[PMCaptcha] Could not get entity for user ${userId}`);
+      return false;
+    }
+
+    // Get full user info with timeout protection
+    const userFull = await Promise.race([
+      client.invoke(new Api.users.GetFullUser({ id: entity })),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('API call timeout')), 10000)
+      )
+    ]) as any;
+    
+    const user = userFull.users[0] as any;
+    const isBot = user.bot === true;
+    
+    // Cache the result
+    botStatusCache.set(userId, {
+      isBot,
+      timestamp: now
+    });
+    
+    // Only log when we detect a bot to reduce noise
+    if (isBot) {
+      console.log(`[PMCaptcha] Detected bot user: ${userId}`);
+    }
+    return isBot;
+    
+  } catch (error) {
+    // Handle specific error types
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (errorMessage.includes('timeout')) {
+      console.warn(`[PMCaptcha] Timeout checking bot status for user ${userId}`);
+    } else {
+      console.error(`[PMCaptcha] Error checking bot status for user ${userId}:`, errorMessage);
+    }
+    // On error, assume it's not a bot to avoid blocking legitimate users
+    return false;
+  }
+}
+
 // Check common groups count for whitelist
 async function checkCommonGroups(
   client: TelegramClient,
@@ -291,36 +387,47 @@ async function verifyStickerResponse(
 
 // Message listener for handling incoming messages
 async function pmcaptchaMessageListener(message: Api.Message) {
-  const client = message.client as TelegramClient;
+  try {
+    const client = message.client as TelegramClient;
 
-  // Only handle private messages
-  if (!message.isPrivate) return;
+    // Only handle private messages
+    if (!message.isPrivate) return;
 
-  if (message.out) return;
+    if (message.out) return;
 
-  const userId = Number(message.senderId);
-  if (!userId) return;
+    const userId = Number(message.senderId);
+    if (!userId) return;
 
-  // Skip if already whitelisted
-  if (dbHelpers.isWhitelisted(userId)) return;
+    // Skip if user is a bot (prevents infinite loops with other bots)
+    if (await isBotUser(client, userId)) {
+      console.log(`[PMCaptcha] Ignoring message from bot user: ${userId}`);
+      return;
+    }
 
-  // Check if user is in active challenge
-  const activeChallenge = activeChallenges.get(userId);
-  if (activeChallenge && activeChallenge.type === "sticker") {
-    // Verify sticker response
-    const hasSticker = !!message.sticker
-    await verifyStickerResponse(client, userId, hasSticker);
-    return;
-  }
+    // Skip if already whitelisted
+    if (dbHelpers.isWhitelisted(userId)) return;
 
-  // Check common groups for auto-whitelist
-  if (await checkCommonGroups(client, userId)) {
-    return; // User was whitelisted via common groups
-  }
+    // Check if user is in active challenge
+    const activeChallenge = activeChallenges.get(userId);
+    if (activeChallenge && activeChallenge.type === "sticker") {
+      // Verify sticker response
+      const hasSticker = !!message.sticker
+      await verifyStickerResponse(client, userId, hasSticker);
+      return;
+    }
 
-  // Start sticker challenge for new users
-  if (!activeChallenge) {
-    await startStickerChallenge(client, userId);
+    // Check common groups for auto-whitelist
+    if (await checkCommonGroups(client, userId)) {
+      return; // User was whitelisted via common groups
+    }
+
+    // Start sticker challenge for new users
+    if (!activeChallenge) {
+      await startStickerChallenge(client, userId);
+    }
+  } catch (error) {
+    console.error(`[PMCaptcha] Unhandled error in message listener:`, error);
+    // Don't rethrow to prevent plugin crash
   }
 }
 
